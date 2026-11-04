@@ -1,39 +1,108 @@
+use std::fmt;
 use std::io;
 
-macro_rules! parse_input {
-    ($x:expr, $t:ident) => {
-        $x.trim().parse::<$t>().unwrap()
-    };
+// Const
+const MAX_THRUST: i32 = 100;
+const MIN_ANGLE: i32 = 90;
+const BOOST_ANGLE: i32 = 15;
+const BOOST_DISTANCE: i32 = 3500;
+
+// Types
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Point {
+    x: i32,
+    y: i32,
 }
 
-/**
- * Auto-generated code below aims at helping you parse
- * the standard input according to the problem statement.
- **/
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct Turn {
+    pod: Point,
+    checkpoint: Point,
+    checkpoint_distance: i32,
+    checkpoint_angle: i32,
+    opponent: Point,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Thrust {
+    Power(i32),
+    Boost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Action {
+    target: Point,
+    thrust: Thrust,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    boost_used: bool,
+}
+
+// Outputs
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.thrust {
+            Thrust::Power(p) => write!(f, "{} {} {}", self.target.x, self.target.y, p),
+            Thrust::Boost => write!(f, "{} {} BOOST", self.target.x, self.target.y),
+        }
+    }
+}
+
+// Inputs
+fn read_ints() -> Option<Vec<i32>> {
+    let mut line = String::new();
+    let bytes = io::stdin().read_line(&mut line).ok()?;
+    if bytes == 0 {
+        return None;
+    }
+    Some(
+        line.split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect(),
+    )
+}
+
+fn read_turn() -> Option<Turn> {
+    let a = read_ints()?; // x y cp_x cp_y cp_dist cp_angle
+    let b = read_ints()?; // opp_x opp_y
+    Some(Turn {
+        pod: Point { x: a[0], y: a[1] },
+        checkpoint: Point { x: a[2], y: a[3] },
+        checkpoint_distance: a[4],
+        checkpoint_angle: a[5],
+        opponent: Point { x: b[0], y: b[1] },
+    })
+}
+
+// Actions
+fn decide(turn: &Turn, state: &mut State) -> Action {
+    let angle = turn.checkpoint_angle.abs();
+
+    let thrust = if angle > MIN_ANGLE {
+        Thrust::Power(0)
+    } else if !state.boost_used && angle < BOOST_ANGLE && turn.checkpoint_distance > BOOST_DISTANCE
+    {
+        state.boost_used = true;
+        Thrust::Boost
+    } else {
+        Thrust::Power(MAX_THRUST)
+    };
+
+    Action {
+        target: turn.checkpoint,
+        thrust,
+    }
+}
+
+// Game Loop
 fn main() {
-    // game loop
-    loop {
-        let mut input_line = String::new();
-        io::stdin().read_line(&mut input_line).unwrap();
-        let inputs = input_line.split(" ").collect::<Vec<_>>();
-        let x = parse_input!(inputs[0], i32);
-        let y = parse_input!(inputs[1], i32);
-        let next_checkpoint_x = parse_input!(inputs[2], i32); // x position of the next check point
-        let next_checkpoint_y = parse_input!(inputs[3], i32); // y position of the next check point
-        let next_checkpoint_dist = parse_input!(inputs[4], i32); // distance to the next checkpoint
-        let next_checkpoint_angle = parse_input!(inputs[5], i32); // angle between your pod orientation and the direction of the next checkpoint
-        let mut input_line = String::new();
-        io::stdin().read_line(&mut input_line).unwrap();
-        let inputs = input_line.split(" ").collect::<Vec<_>>();
-        let opponent_x = parse_input!(inputs[0], i32);
-        let opponent_y = parse_input!(inputs[1], i32);
-
-        // Write an action using println!("message...");
-        // To debug: eprintln!("Debug message...");
-
-        // You have to output the target position
-        // followed by the power (0 <= thrust <= 100) or "BOOST"
-        // i.e.: "x y thrust"
-        println!("{} {} 80", next_checkpoint_x, next_checkpoint_y);
+    let mut state = State::default();
+    while let Some(turn) = read_turn() {
+        let action = decide(&turn, &mut state);
+        eprintln!("{:?} -> {}", turn, action);
+        println!("{}", action);
     }
 }
