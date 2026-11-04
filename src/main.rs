@@ -1,6 +1,7 @@
 use std::fmt;
+use std::fmt::write;
 use std::io;
-use std::ops::{Mul, Sub};
+use std::ops::{Add, Mul, Sub};
 
 // Const
 const MAX_THRUST: i32 = 100;
@@ -10,12 +11,46 @@ const BOOST_DISTANCE: i32 = 3500;
 const BRAKE_DISTANCE: i32 = 1500;
 const BRAKE_ANGLE: i32 = 30;
 const DRIFT_FACTOR: i32 = 3;
+const COLLISION_DISTANCE: i32 = 800;
+const SHIELD_MIN: i32 = 400;
+const SHIELD_CD: i32 = 3;
 
 // Types
+#[allow(dead_code)]
+#[derive(Debug)]
+struct Game {
+    laps: i32,
+    checkpoints: Vec<Point>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Pod {
+    pos: Point,
+    vel: Point,
+    angle: i32,
+    next_cp: usize,
+}
+
+#[derive(Debug)]
+struct Turn {
+    my_pods: [Pod; 2],
+    opp_pods: [Pod; 2],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct Point {
     x: i32,
     y: i32,
+}
+
+impl Add for Point {
+    type Output = Point;
+    fn add(self, other: Point) -> Point {
+        Point {
+            x: self.x + other.x,
+            y: self.y + other.y,
+        }
+    }
 }
 
 impl Sub for Point {
@@ -38,20 +73,21 @@ impl Mul<i32> for Point {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-struct Turn {
-    pod: Point,
-    checkpoint: Point,
-    checkpoint_distance: i32,
-    checkpoint_angle: i32,
-    opponent: Point,
+impl Point {
+    fn norm2(self) -> i64 {
+        let (x, y) = (self.x as i64, self.y as i64);
+        x * x + y * y
+    }
+    fn len(self) -> f64 {
+        (self.norm2() as f64).sqrt()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Thrust {
     Power(i32),
     Boost,
+    Shield,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,8 +98,8 @@ struct Action {
 
 #[derive(Debug, Default)]
 struct State {
+    turn: i32,
     boost_used: bool,
-    last_pod: Option<Point>,
 }
 
 // Outputs
@@ -72,6 +108,7 @@ impl fmt::Display for Action {
         match self.thrust {
             Thrust::Power(p) => write!(f, "{} {} {}", self.target.x, self.target.y, p),
             Thrust::Boost => write!(f, "{} {} BOOST", self.target.x, self.target.y),
+            Thrust::Shield => write!(f, "{} {} SHIELD", self.target.x, self.target.y),
         }
     }
 }
@@ -90,15 +127,31 @@ fn read_ints() -> Option<Vec<i32>> {
     )
 }
 
+fn read_game() -> Option<Game> {
+    let laps = read_ints()?[0];
+    let count = read_ints()?[0];
+    let mut checkpoints = Vec::new();
+    for _ in 0..count {
+        let v = read_ints()?;
+        checkpoints.push(Point { x: v[0], y: v[1] });
+    }
+    Some(Game { laps, checkpoints })
+}
+
+fn read_pod() -> Option<Pod> {
+    let v = read_ints()?;
+    Some(Pod {
+        pos: Point { x: v[0], y: v[1] },
+        vel: Point { x: v[2], y: v[3] },
+        angle: v[4],
+        next_cp: v[5] as usize,
+    })
+}
+
 fn read_turn() -> Option<Turn> {
-    let a = read_ints()?; // x y cp_x cp_y cp_dist cp_angle
-    let b = read_ints()?; // opp_x opp_y
     Some(Turn {
-        pod: Point { x: a[0], y: a[1] },
-        checkpoint: Point { x: a[2], y: a[3] },
-        checkpoint_distance: a[4],
-        checkpoint_angle: a[5],
-        opponent: Point { x: b[0], y: b[1] },
+        my_pods: [read_pod()?, read_pod()?],
+        opp_pods: [read_pod()?, read_pod()?],
     })
 }
 
@@ -120,41 +173,54 @@ fn brake(power: i32, angle: i32, distance: i32) -> i32 {
     }
 }
 
-fn update_speed(turn: &Turn, state: &mut State) -> Point {
-    let speed = match state.last_pod {
-        Some(last) => turn.pod - last,
-        None => Point::default(),
+fn angle_to(pod: &Pod, target: Point, first_turn: bool) -> i32 {
+    if first_turn {
+        return 0;
+    }
+    let d = target - pod.pos;
+    let wanted = (d.y as f64).atan2(d.x as f64).to_degrees();
+    let diff = (wanted - pod.angle as f64 + 540.0).rem_euclid(360.0) - 180.0;
+    diff.round() as i32
+}
+
+fn race(game: &Game, pod: &Pod, state: &State) -> Action {
+    let cp = game.checkpoints[pod.next_cp];
+    let distance = (cp - pod.pos).len() as i32;
+    let target = cp - pod.vel * DRIFT_FACTOR;
+
+    let angle = angle_to(pod, target, state.turn == 1).abs();
+    let thrust = if !state.boost_used && angle < BOOST_ANGLE && distance > BOOST_DISTANCE {
+        Thrust::Boost
+    } else {
+        Thrust::Power(brake(throttle(angle), angle, distance))
     };
-    state.last_pod = Some(turn.pod);
-    speed
+    Action { target, thrust }
 }
 
 // Actions
-fn decide(turn: &Turn, state: &mut State) -> Action {
-    let angle = turn.checkpoint_angle.abs();
-
-    let speed = update_speed(turn, state);
-
-    let thrust =
-        if !state.boost_used && angle < BOOST_ANGLE && turn.checkpoint_distance > BOOST_DISTANCE {
-            state.boost_used = true;
-            Thrust::Boost
-        } else {
-            Thrust::Power(brake(throttle(angle), angle, turn.checkpoint_distance))
-        };
-
-    Action {
-        target: turn.checkpoint - speed * DRIFT_FACTOR,
-        thrust,
+fn decide(game: &Game, turn: &Turn, state: &mut State) -> [Action; 2] {
+    state.turn += 1;
+    let actions = [
+        race(game, &turn.my_pods[0], state),
+        race(game, &turn.my_pods[1], state),
+    ];
+    if actions.iter().any(|a| a.thrust == Thrust::Boost) {
+        state.boost_used = true;
     }
+    actions
 }
 
 // Game Loop
 fn main() {
+    let game = match read_game() {
+        Some(g) => g,
+        None => return,
+    };
+    eprintln!("{:?}", game);
     let mut state = State::default();
     while let Some(turn) = read_turn() {
-        let action = decide(&turn, &mut state);
-        eprintln!("{:?} -> {}", turn, action);
-        println!("{}", action);
+        for action in decide(&game, &turn, &mut state) {
+            println!("{}", action);
+        }
     }
 }
