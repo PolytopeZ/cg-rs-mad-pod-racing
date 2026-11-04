@@ -1,17 +1,41 @@
 use std::fmt;
 use std::io;
+use std::ops::{Mul, Sub};
 
 // Const
 const MAX_THRUST: i32 = 100;
 const MIN_ANGLE: i32 = 90;
 const BOOST_ANGLE: i32 = 15;
 const BOOST_DISTANCE: i32 = 3500;
+const BRAKE_DISTANCE: i32 = 1500;
+const BRAKE_ANGLE: i32 = 30;
+const DRIFT_FACTOR: i32 = 3;
 
 // Types
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct Point {
     x: i32,
     y: i32,
+}
+
+impl Sub for Point {
+    type Output = Point;
+    fn sub(self, other: Point) -> Point {
+        Point {
+            x: self.x - other.x,
+            y: self.y - other.y,
+        }
+    }
+}
+
+impl Mul<i32> for Point {
+    type Output = Point;
+    fn mul(self, k: i32) -> Point {
+        Point {
+            x: self.x * k,
+            y: self.y * k,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -39,6 +63,7 @@ struct Action {
 #[derive(Debug, Default)]
 struct State {
     boost_used: bool,
+    last_pod: Option<Point>,
 }
 
 // Outputs
@@ -77,22 +102,49 @@ fn read_turn() -> Option<Turn> {
     })
 }
 
+// Utils
+fn throttle(angle: i32) -> i32 {
+    if angle >= MIN_ANGLE {
+        return 0;
+    }
+    // change speed depending on angle
+    let factor = (angle as f64).to_radians().cos();
+    (MAX_THRUST as f64 * factor).round() as i32
+}
+
+fn brake(power: i32, angle: i32, distance: i32) -> i32 {
+    if distance < BRAKE_DISTANCE && angle > BRAKE_ANGLE {
+        power * distance / BRAKE_DISTANCE
+    } else {
+        power
+    }
+}
+
+fn update_speed(turn: &Turn, state: &mut State) -> Point {
+    let speed = match state.last_pod {
+        Some(last) => turn.pod - last,
+        None => Point::default(),
+    };
+    state.last_pod = Some(turn.pod);
+    speed
+}
+
 // Actions
 fn decide(turn: &Turn, state: &mut State) -> Action {
     let angle = turn.checkpoint_angle.abs();
 
-    let thrust = if angle > MIN_ANGLE {
-        Thrust::Power(0)
-    } else if !state.boost_used && angle < BOOST_ANGLE && turn.checkpoint_distance > BOOST_DISTANCE
-    {
-        state.boost_used = true;
-        Thrust::Boost
-    } else {
-        Thrust::Power(MAX_THRUST)
-    };
+    let speed = update_speed(turn, state);
+
+    let thrust =
+        if !state.boost_used && angle < BOOST_ANGLE && turn.checkpoint_distance > BOOST_DISTANCE {
+            state.boost_used = true;
+            Thrust::Boost
+        } else {
+            Thrust::Power(brake(throttle(angle), angle, turn.checkpoint_distance))
+        };
 
     Action {
-        target: turn.checkpoint,
+        target: turn.checkpoint - speed * DRIFT_FACTOR,
         thrust,
     }
 }
