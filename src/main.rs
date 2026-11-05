@@ -1,5 +1,4 @@
 use std::fmt;
-use std::fmt::write;
 use std::io;
 use std::ops::{Add, Mul, Sub};
 
@@ -17,6 +16,7 @@ const SHIELD_CD: i32 = 3;
 const CHECKPOINT_RADIUS: i32 = 600;
 const CORNER_CUT_TURNS: f64 = 2.0;
 const BLOCKER_TURNS: i32 = 3;
+const WAIT_DISTANCE: i64 = 2000;
 
 // Types
 #[allow(dead_code)]
@@ -24,6 +24,7 @@ const BLOCKER_TURNS: i32 = 3;
 struct Game {
     laps: i32,
     checkpoints: Vec<Point>,
+    boost_cp: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +96,9 @@ impl Point {
     fn len(self) -> f64 {
         (self.norm2() as f64).sqrt()
     }
+    fn dot(self, other: Point) -> i64 {
+        self.x as i64 * other.x as i64 + self.y as i64 * other.y as i64
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -117,6 +121,7 @@ struct State {
     shield_cd: [i32; 2],
     last_cp: [Option<usize>; 4],
     passed_cp: [i32; 4],
+    runner: usize,
 }
 
 // Outputs
@@ -152,7 +157,12 @@ fn read_game() -> Option<Game> {
         let v = read_ints()?;
         checkpoints.push(Point { x: v[0], y: v[1] });
     }
-    Some(Game { laps, checkpoints })
+    let boost_cp = best_boost_cp(&checkpoints);
+    Some(Game {
+        laps,
+        checkpoints,
+        boost_cp,
+    })
 }
 
 fn read_pod() -> Option<Pod> {
@@ -214,7 +224,11 @@ fn race(game: &Game, pod: &Pod, state: &State) -> Action {
     let target = aim - pod.vel * DRIFT_FACTOR;
 
     let angle = angle_to(pod, target, state.turn == 1).abs();
-    let thrust = if !state.boost_used && angle < BOOST_ANGLE && distance > BOOST_DISTANCE {
+    let thrust = if !state.boost_used
+        && angle < BOOST_ANGLE
+        && distance > BOOST_DISTANCE
+        && pod.next_cp == game.boost_cp
+    {
         Thrust::Boost
     } else {
         Thrust::Power(brake(throttle(angle), angle, distance))
@@ -246,9 +260,31 @@ fn opp_leader(game: &Game, turn: &Turn, state: &State) -> Pod {
     }
 }
 
-fn block(pod: &Pod, pod_target: &Pod, state: &State) -> Action {
-    let target = pod_target.pos + pod_target.vel * BLOCKER_TURNS;
-    let angle = angle_to(pod, target, state.turn == 1).abs();
+fn block(game: &Game, pod: &Pod, pod_target: &Pod, state: &State) -> Action {
+    let cps = &game.checkpoints;
+    let first_turn = state.turn == 1;
+    let target_cp = cps[pod_target.next_cp];
+
+    let ahead = (target_cp - pod.pos).norm2() < (target_cp - pod_target.pos).norm2();
+    if ahead {
+        let target = pod_target.pos + pod_target.vel * BLOCKER_TURNS;
+        let angle = angle_to(pod, target, first_turn).abs();
+        return Action {
+            target,
+            thrust: Thrust::Power(throttle(angle)),
+        };
+    }
+
+    let wait = cps[(pod_target.next_cp + 1) % cps.len()];
+    if (wait - pod.pos).norm2() < WAIT_DISTANCE * WAIT_DISTANCE {
+        return Action {
+            target: pod_target.pos,
+            thrust: Thrust::Power(0),
+        };
+    }
+
+    let target = wait - pod.vel * DRIFT_FACTOR;
+    let angle = angle_to(pod, target, first_turn).abs();
     Action {
         target,
         thrust: Thrust::Power(throttle(angle)),
@@ -262,28 +298,58 @@ fn will_hit(me: &Pod, other: &Pod) -> bool {
         && collision.norm2() > SHIELD_MIN * SHIELD_MIN
 }
 
-fn shield_or_speed(me: &Pod, turn: &Turn, cooldown: &mut i32, thrust: Thrust) -> Thrust {
+fn shield_or_speed(
+    me: &Pod,
+    turn: &Turn,
+    cooldown: &mut i32,
+    thrust: Thrust,
+    facing: bool,
+) -> Thrust {
     if *cooldown > 0 {
         *cooldown -= 1;
         return Thrust::Power(0);
     }
-    if turn.opp_pods.iter().any(|other| will_hit(me, other)) {
+    let hit = |other: &Pod| will_hit(me, other) && (!facing || me.vel.dot(other.vel) < 0);
+    if turn.opp_pods.iter().any(hit) {
         *cooldown = SHIELD_CD;
         return Thrust::Shield;
     }
     thrust
 }
 
+fn choose_runner(state: &State) -> usize {
+    let other = 1 - state.runner;
+    if state.passed_cp[other] > state.passed_cp[state.runner] {
+        other
+    } else {
+        state.runner
+    }
+}
+
+fn best_boost_cp(cps: &[Point]) -> usize {
+    let n = cps.len();
+    let path = |i: usize| (cps[(i + 1) % n] - cps[i]).norm2();
+    let start = (0..n).max_by_key(|&i| path(i)).unwrap_or(0);
+    (start + 1) % n
+}
+
 // Actions
 fn decide(game: &Game, turn: &Turn, state: &mut State) -> [Action; 2] {
     state.turn += 1;
     update_progress(turn, state);
+    state.runner = choose_runner(state);
+    let pod_runner = state.runner;
+    let pod_blocker = 1 - pod_runner;
 
     let leader = opp_leader(game, turn, state);
-    let mut actions = [
-        race(game, &turn.my_pods[0], state),
-        block(&turn.my_pods[1], &leader, state),
-    ];
+    let runner = race(game, &turn.my_pods[pod_runner], state);
+    let blocker = block(game, &turn.my_pods[pod_blocker], &leader, state);
+
+    let mut actions = if pod_runner == 0 {
+        [runner, blocker]
+    } else {
+        [blocker, runner]
+    };
 
     for i in 0..2 {
         actions[i].thrust = shield_or_speed(
@@ -291,6 +357,7 @@ fn decide(game: &Game, turn: &Turn, state: &mut State) -> [Action; 2] {
             turn,
             &mut state.shield_cd[i],
             actions[i].thrust,
+            i == pod_runner,
         );
         if actions[i].thrust == Thrust::Boost {
             state.boost_used = true;
