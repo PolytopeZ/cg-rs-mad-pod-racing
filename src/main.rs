@@ -11,9 +11,12 @@ const BOOST_DISTANCE: i32 = 3500;
 const BRAKE_DISTANCE: i32 = 1500;
 const BRAKE_ANGLE: i32 = 30;
 const DRIFT_FACTOR: i32 = 3;
-const COLLISION_DISTANCE: i32 = 800;
-const SHIELD_MIN: i32 = 400;
+const COLLISION_DISTANCE: i64 = 800;
+const SHIELD_MIN: i64 = 400;
 const SHIELD_CD: i32 = 3;
+const CHECKPOINT_RADIUS: i32 = 600;
+const CORNER_CUT_TURNS: f64 = 2.0;
+const BLOCKER_TURNS: i32 = 3;
 
 // Types
 #[allow(dead_code)]
@@ -35,6 +38,17 @@ struct Pod {
 struct Turn {
     my_pods: [Pod; 2],
     opp_pods: [Pod; 2],
+}
+
+impl Turn {
+    fn all(&self) -> [Pod; 4] {
+        [
+            self.my_pods[0],
+            self.my_pods[1],
+            self.opp_pods[0],
+            self.opp_pods[1],
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -100,6 +114,9 @@ struct Action {
 struct State {
     turn: i32,
     boost_used: bool,
+    shield_cd: [i32; 2],
+    last_cp: [Option<usize>; 4],
+    passed_cp: [i32; 4],
 }
 
 // Outputs
@@ -185,8 +202,16 @@ fn angle_to(pod: &Pod, target: Point, first_turn: bool) -> i32 {
 
 fn race(game: &Game, pod: &Pod, state: &State) -> Action {
     let cp = game.checkpoints[pod.next_cp];
+    let cps = &game.checkpoints;
     let distance = (cp - pod.pos).len() as i32;
-    let target = cp - pod.vel * DRIFT_FACTOR;
+    let next = cps[(pod.next_cp + 1) % cps.len()];
+    let gap = (distance - CHECKPOINT_RADIUS) as f64;
+    let aim = if gap < pod.vel.len() * CORNER_CUT_TURNS {
+        next
+    } else {
+        cp
+    };
+    let target = aim - pod.vel * DRIFT_FACTOR;
 
     let angle = angle_to(pod, target, state.turn == 1).abs();
     let thrust = if !state.boost_used && angle < BOOST_ANGLE && distance > BOOST_DISTANCE {
@@ -197,15 +222,79 @@ fn race(game: &Game, pod: &Pod, state: &State) -> Action {
     Action { target, thrust }
 }
 
+fn update_progress(turn: &Turn, state: &mut State) {
+    for (i, pod) in turn.all().iter().enumerate() {
+        if let Some(prev) = state.last_cp[i] {
+            if prev != pod.next_cp {
+                state.passed_cp[i] += 1;
+            }
+        }
+        state.last_cp[i] = Some(pod.next_cp);
+    }
+}
+
+fn opp_leader(game: &Game, turn: &Turn, state: &State) -> Pod {
+    let key = |i: usize| {
+        let pod = turn.opp_pods[i];
+        let left = (game.checkpoints[pod.next_cp] - pod.pos).norm2();
+        (state.passed_cp[2 + i], -left)
+    };
+    if key(0) >= key(1) {
+        turn.opp_pods[0]
+    } else {
+        turn.opp_pods[1]
+    }
+}
+
+fn block(pod: &Pod, pod_target: &Pod, state: &State) -> Action {
+    let target = pod_target.pos + pod_target.vel * BLOCKER_TURNS;
+    let angle = angle_to(pod, target, state.turn == 1).abs();
+    Action {
+        target,
+        thrust: Thrust::Power(throttle(angle)),
+    }
+}
+
+fn will_hit(me: &Pod, other: &Pod) -> bool {
+    let dist = (me.pos + me.vel) - (other.pos + other.vel);
+    let collision = me.vel - other.vel;
+    dist.norm2() < COLLISION_DISTANCE * COLLISION_DISTANCE
+        && collision.norm2() > SHIELD_MIN * SHIELD_MIN
+}
+
+fn shield_or_speed(me: &Pod, turn: &Turn, cooldown: &mut i32, thrust: Thrust) -> Thrust {
+    if *cooldown > 0 {
+        *cooldown -= 1;
+        return Thrust::Power(0);
+    }
+    if turn.opp_pods.iter().any(|other| will_hit(me, other)) {
+        *cooldown = SHIELD_CD;
+        return Thrust::Shield;
+    }
+    thrust
+}
+
 // Actions
 fn decide(game: &Game, turn: &Turn, state: &mut State) -> [Action; 2] {
     state.turn += 1;
-    let actions = [
+    update_progress(turn, state);
+
+    let leader = opp_leader(game, turn, state);
+    let mut actions = [
         race(game, &turn.my_pods[0], state),
-        race(game, &turn.my_pods[1], state),
+        block(&turn.my_pods[1], &leader, state),
     ];
-    if actions.iter().any(|a| a.thrust == Thrust::Boost) {
-        state.boost_used = true;
+
+    for i in 0..2 {
+        actions[i].thrust = shield_or_speed(
+            &turn.my_pods[1],
+            turn,
+            &mut state.shield_cd[i],
+            actions[i].thrust,
+        );
+        if actions[i].thrust == Thrust::Boost {
+            state.boost_used = true;
+        }
     }
     actions
 }
