@@ -287,7 +287,7 @@ fn decide(game: &Game, turn: &Turn, state: &mut State) -> [Action; 2] {
 
     for i in 0..2 {
         actions[i].thrust = shield_or_speed(
-            &turn.my_pods[1],
+            &turn.my_pods[i],
             turn,
             &mut state.shield_cd[i],
             actions[i].thrust,
