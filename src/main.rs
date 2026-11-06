@@ -3,20 +3,23 @@ use std::io;
 use std::ops::{Add, Mul, Sub};
 
 // Const
-const MAX_THRUST: i32 = 100;
+const MAX_THRUST: i32 = 200;
 const MIN_ANGLE: i32 = 90;
 const BOOST_ANGLE: i32 = 15;
 const BOOST_DISTANCE: i32 = 3500;
-const BRAKE_DISTANCE: i32 = 1500;
+const BRAKE_TURNS: f64 = 3.0;
 const BRAKE_ANGLE: i32 = 30;
 const DRIFT_FACTOR: i32 = 3;
 const COLLISION_DISTANCE: i64 = 800;
-const SHIELD_MIN: i64 = 400;
+const SHIELD_MIN: f64 = 0.7;
 const SHIELD_CD: i32 = 3;
 const CHECKPOINT_RADIUS: i32 = 600;
 const CORNER_CUT_TURNS: f64 = 2.0;
 const BLOCKER_TURNS: i32 = 3;
 const WAIT_DISTANCE: i64 = 2000;
+const FRICTION: f64 = 0.85;
+const MAX_SPEED: f64 = MAX_THRUST as f64 * FRICTION / (1.0 - FRICTION);
+const GLIDE_TURNS: f64 = 1.0 / (1.0 - FRICTION);
 
 // Types
 #[allow(dead_code)]
@@ -192,9 +195,9 @@ fn throttle(angle: i32) -> i32 {
     (MAX_THRUST as f64 * factor).round() as i32
 }
 
-fn brake(power: i32, angle: i32, distance: i32) -> i32 {
-    if distance < BRAKE_DISTANCE && angle > BRAKE_ANGLE {
-        power * distance / BRAKE_DISTANCE
+fn brake(power: i32, angle: i32, turns_left: f64) -> i32 {
+    if turns_left < BRAKE_TURNS && angle > BRAKE_ANGLE {
+        (power as f64 * turns_left / BRAKE_TURNS).round() as i32
     } else {
         power
     }
@@ -221,8 +224,9 @@ fn race(game: &Game, pod: &Pod, state: &State) -> Action {
     } else {
         cp
     };
-    let target = aim - pod.vel * DRIFT_FACTOR;
+    let target = aim - drift(pod.vel, aim - pod.pos) * DRIFT_FACTOR;
 
+    let turns_left = distance as f64 / pod.vel.len().max(1.0);
     let angle = angle_to(pod, target, state.turn == 1).abs();
     let thrust = if !state.boost_used
         && angle < BOOST_ANGLE
@@ -231,7 +235,7 @@ fn race(game: &Game, pod: &Pod, state: &State) -> Action {
     {
         Thrust::Boost
     } else {
-        Thrust::Power(brake(throttle(angle), angle, distance))
+        Thrust::Power(brake(throttle(angle), angle, turns_left))
     };
     Action { target, thrust }
 }
@@ -276,14 +280,14 @@ fn block(game: &Game, pod: &Pod, pod_target: &Pod, state: &State) -> Action {
     }
 
     let wait = cps[(pod_target.next_cp + 1) % cps.len()];
-    if (wait - pod.pos).norm2() < WAIT_DISTANCE * WAIT_DISTANCE {
+    if (wait - stop_at_point(pod)).norm2() < WAIT_DISTANCE * WAIT_DISTANCE {
         return Action {
             target: pod_target.pos,
             thrust: Thrust::Power(0),
         };
     }
 
-    let target = wait - pod.vel * DRIFT_FACTOR;
+    let target = wait - drift(pod.vel, wait - pod.pos) * DRIFT_FACTOR;
     let angle = angle_to(pod, target, first_turn).abs();
     Action {
         target,
@@ -295,7 +299,7 @@ fn will_hit(me: &Pod, other: &Pod) -> bool {
     let dist = (me.pos + me.vel) - (other.pos + other.vel);
     let collision = me.vel - other.vel;
     dist.norm2() < COLLISION_DISTANCE * COLLISION_DISTANCE
-        && collision.norm2() > SHIELD_MIN * SHIELD_MIN
+        && collision.norm2() as f64 > (SHIELD_MIN * MAX_SPEED).powi(2)
 }
 
 fn shield_or_speed(
@@ -331,6 +335,25 @@ fn best_boost_cp(cps: &[Point]) -> usize {
     let path = |i: usize| (cps[(i + 1) % n] - cps[i]).norm2();
     let start = (0..n).max_by_key(|&i| path(i)).unwrap_or(0);
     (start + 1) % n
+}
+
+fn drift(vel: Point, direction: Point) -> Point {
+    let dist = direction.norm2();
+    if dist == 0 {
+        return vel; // already on it
+    }
+    let k = vel.dot(direction) as f64 / dist as f64;
+    Point {
+        x: vel.x - (direction.x as f64 * k).round() as i32,
+        y: vel.y - (direction.y as f64 * k).round() as i32,
+    }
+}
+
+fn stop_at_point(pod: &Pod) -> Point {
+    Point {
+        x: pod.pos.x + (pod.vel.x as f64 * GLIDE_TURNS).round() as i32,
+        y: pod.pos.y + (pod.vel.y as f64 * GLIDE_TURNS).round() as i32,
+    }
 }
 
 // Actions
