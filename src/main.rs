@@ -20,6 +20,7 @@ const WAIT_DISTANCE: i64 = 2000;
 const FRICTION: f64 = 0.85;
 const MAX_SPEED: f64 = MAX_THRUST as f64 * FRICTION / (1.0 - FRICTION);
 const GLIDE_TURNS: f64 = 1.0 / (1.0 - FRICTION);
+const COLLIDE_DISTANCE: i64 = 1000;
 
 // Types
 #[allow(dead_code)]
@@ -125,6 +126,79 @@ struct State {
     last_cp: [Option<usize>; 4],
     passed_cp: [i32; 4],
     runner: usize,
+    simulated: Option<[Pod; 2]>,
+}
+
+// Sim
+mod sim {
+    use super::*;
+    const MAX_ROTATION: f64 = 18.0;
+    const BOOST_POWER: f64 = 650.0;
+
+    pub fn angle_diff(pod: &Pod, target: Point) -> f64 {
+        let dist = target - pod.pos;
+        let target = (dist.y as f64).atan2(dist.x as f64).to_degrees();
+        (target - pod.angle as f64 + 540.0).rem_euclid(360.0) - 180.0
+    }
+
+    fn power(thrust: Thrust) -> f64 {
+        match thrust {
+            Thrust::Power(p) => p as f64,
+            Thrust::Boost => BOOST_POWER,
+            Thrust::Shield => 0.0,
+        }
+    }
+
+    pub fn step(game: &Game, pod: &Pod, action: &Action, first_turn: bool) -> Pod {
+        // rotate
+        let diff = if action.target == pod.pos {
+            0.0
+        } else {
+            angle_diff(pod, action.target)
+        };
+        let turn = if first_turn {
+            diff
+        } else {
+            diff.clamp(-MAX_ROTATION, MAX_ROTATION)
+        };
+        let angle = (pod.angle as f64 + turn).rem_euclid(360.0);
+
+        // speed
+        let (sin, cos) = angle.to_radians().sin_cos();
+        let pow = power(action.thrust);
+        let vx = pod.vel.x as f64 + cos * pow;
+        let vy = pod.vel.y as f64 + sin * pow;
+
+        // move
+        let x = pod.pos.x as f64 + vx;
+        let y = pod.pos.y as f64 + vy;
+
+        // friction and clamp
+        let pos = Point {
+            x: x.round() as i32,
+            y: y.round() as i32,
+        };
+        let vel = Point {
+            x: (vx * FRICTION).trunc() as i32,
+            y: (vy * FRICTION).trunc() as i32,
+        };
+
+        // cp
+        let cps = &game.checkpoints;
+        let radius = CHECKPOINT_RADIUS as i64;
+        let next_cp = if (cps[pod.next_cp] - pos).norm2() < radius * radius {
+            (pod.next_cp + 1) % cps.len()
+        } else {
+            pod.next_cp
+        };
+
+        Pod {
+            pos,
+            vel,
+            angle: angle.round() as i32 % 360,
+            next_cp,
+        }
+    }
 }
 
 // Outputs
@@ -207,10 +281,7 @@ fn angle_to(pod: &Pod, target: Point, first_turn: bool) -> i32 {
     if first_turn {
         return 0;
     }
-    let d = target - pod.pos;
-    let wanted = (d.y as f64).atan2(d.x as f64).to_degrees();
-    let diff = (wanted - pod.angle as f64 + 540.0).rem_euclid(360.0) - 180.0;
-    diff.round() as i32
+    sim::angle_diff(pod, target).round() as i32
 }
 
 fn race(game: &Game, pod: &Pod, state: &State) -> Action {
@@ -356,9 +427,41 @@ fn stop_at_point(pod: &Pod) -> Point {
     }
 }
 
+fn check_simulation(turn: &Turn, state: &State) {
+    let simulated = match state.simulated {
+        Some(p) => p,
+        None => return,
+    };
+
+    let all = turn.all();
+    for i in 0..2 {
+        let (s, a) = (simulated[i], turn.my_pods[i]);
+        let dpos = a.pos - s.pos;
+        let dvel = a.vel - s.vel;
+        let dangle = (a.angle - s.angle + 540).rem_euclid(360) - 180;
+        let cp_ok = a.next_cp == s.next_cp;
+        let contact = all
+            .iter()
+            .enumerate()
+            .any(|(j, o)| j != i && (o.pos - a.pos).norm2() < COLLIDE_DISTANCE * COLLIDE_DISTANCE);
+        eprintln!(
+            "pod {} err pos ({},{}) vel ({},{}) angle {} cp_ok {}{}",
+            i,
+            dpos.x,
+            dpos.y,
+            dvel.x,
+            dvel.y,
+            dangle,
+            cp_ok,
+            if contact { " (contact?)" } else { "" }
+        );
+    }
+}
+
 // Actions
 fn decide(game: &Game, turn: &Turn, state: &mut State) -> [Action; 2] {
     state.turn += 1;
+    check_simulation(turn, state);
     update_progress(turn, state);
     state.runner = choose_runner(state);
     let pod_runner = state.runner;
@@ -386,6 +489,12 @@ fn decide(game: &Game, turn: &Turn, state: &mut State) -> [Action; 2] {
             state.boost_used = true;
         }
     }
+
+    let first_turn = state.turn == 1;
+    state.simulated = Some([
+        sim::step(game, &turn.my_pods[0], &actions[0], first_turn),
+        sim::step(game, &turn.my_pods[1], &actions[1], first_turn),
+    ]);
     actions
 }
 
