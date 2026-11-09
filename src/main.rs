@@ -1,10 +1,7 @@
 use std::fmt;
 use std::io;
-use std::iter::Successors;
 use std::ops::{Add, Mul, Sub};
 use std::time::Instant;
-
-use crate::sim::angle_diff;
 
 // Const
 const MAX_THRUST: i32 = 200;
@@ -28,8 +25,6 @@ const COLLIDE_DISTANCE: i64 = 1000;
 const AIM_DISTANCE: f64 = 10000.0;
 const SIM_DEPTH: usize = 10;
 const CP_PASS_REWARD: f64 = 100000.0;
-const SEARCH_ANGLES: [f64; 5] = [-18.0, -9.0, 0.0, 9.0, 18.0];
-const SEARCH_THRUSTS: [i32; 5] = [0, 50, 100, 150, 200];
 const PLAN_TURNS: usize = 6;
 const MAX_TURN: f64 = 18.0;
 const SEARCH_MS: u128 = 40;
@@ -643,65 +638,6 @@ fn point_toward(pod: &Pod, angle: f64) -> Point {
         x: pod.pos.x + (cos * AIM_DISTANCE).round() as i32,
         y: pod.pos.y + (sin * AIM_DISTANCE).round() as i32,
     }
-}
-
-fn eval(game: &Game, pod: &Pod, action: Action, first_turn: bool) -> f64 {
-    let mut p = sim::step(game, pod, &action, first_turn);
-    let mut passed = (p.next_cp != pod.next_cp) as i32;
-    for _ in 0..SIM_DEPTH {
-        let previous = p.next_cp;
-        let next_move = race(game, &p, false, false);
-        p = sim::step(game, &p, &next_move, false);
-        if p.next_cp != previous {
-            passed += 1;
-        }
-    }
-    let left = (game.checkpoints[p.next_cp] - p.pos).len();
-    passed as f64 * CP_PASS_REWARD - left
-}
-
-fn search(game: &Game, pod: &Pod, state: &State) -> Action {
-    let first_turn = state.turn == 1;
-    let heuristic = race(game, pod, first_turn, !state.boost_used);
-
-    let base = if first_turn {
-        let d = game.checkpoints[pod.next_cp] - pod.pos;
-        (d.y as f64).atan2(d.x as f64).to_degrees()
-    } else {
-        pod.angle as f64
-    };
-    let thrusts: Vec<Thrust> = if heuristic.thrust == Thrust::Boost {
-        vec![Thrust::Boost]
-    } else {
-        SEARCH_THRUSTS.iter().map(|&t| Thrust::Power(t)).collect()
-    };
-
-    let mut candidates: Vec<Action> = SEARCH_ANGLES
-        .iter()
-        .flat_map(|&offset| {
-            thrusts.iter().map(move |&thrust| Action {
-                target: point_toward(pod, base + offset),
-                thrust,
-            })
-        })
-        .collect();
-    candidates.push(heuristic);
-
-    let best = candidates
-        .into_iter()
-        .map(|a| (a, eval(game, pod, a, first_turn)))
-        .max_by(|x, y| x.1.total_cmp(&y.1));
-
-    // debug
-    if let Some((a, score)) = best {
-        let h = eval(game, pod, heuristic, first_turn);
-        eprintln!(
-            "search: best {} ({:.0}) // heuristic {} ({:.0})",
-            a, score, heuristic, h
-        );
-    }
-
-    best.map(|(a, _)| a).unwrap_or(heuristic)
 }
 
 fn check_simulation(turn: &Turn, state: &State) {
